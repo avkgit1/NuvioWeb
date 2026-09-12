@@ -38,7 +38,7 @@ jobs:
         id: frontend-meta
         uses: docker/metadata-action@369eb591f429131d6889c46b94e711f089e6ca96 # v5.6.1
         with:
-          images: ghcr.io/alphasquare404/nuvioweb
+          images: ghcr.io/avkgit1/nuvioweb
           flavor: |
             latest=false
           tags: |
@@ -53,7 +53,7 @@ jobs:
         id: trakt-meta
         uses: docker/metadata-action@369eb591f429131d6889c46b94e711f089e6ca96 # v5.6.1
         with:
-          images: ghcr.io/alphasquare404/nuvioweb-trakt-auth-bridge
+          images: ghcr.io/avkgit1/nuvioweb-trakt-auth-bridge
           flavor: |
             latest=false
           tags: |
@@ -68,7 +68,7 @@ jobs:
         id: debrid-meta
         uses: docker/metadata-action@369eb591f429131d6889c46b94e711f089e6ca96 # v5.6.1
         with:
-          images: ghcr.io/alphasquare404/nuvioweb-debrid-api-bridge
+          images: ghcr.io/avkgit1/nuvioweb-debrid-api-bridge
           flavor: |
             latest=false
           tags: |
