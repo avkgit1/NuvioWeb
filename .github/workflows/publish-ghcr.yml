@@ -84,7 +84,7 @@ jobs:
         with:
           context: .
           file: ./Dockerfile
-          platforms: linux/amd64
+          platforms: linux/amd64,linux/arm64/v8
           push: true
           tags: ${{ steps.frontend-meta.outputs.tags }}
           labels: ${{ steps.frontend-meta.outputs.labels }}
@@ -96,7 +96,7 @@ jobs:
         with:
           context: .
           file: ./services/trakt-auth-bridge/Dockerfile
-          platforms: linux/amd64
+          platforms: linux/amd64,linux/arm64/v8
           push: true
           tags: ${{ steps.trakt-meta.outputs.tags }}
           labels: ${{ steps.trakt-meta.outputs.labels }}
@@ -108,7 +108,7 @@ jobs:
         with:
           context: .
           file: ./services/debrid-api-bridge/Dockerfile
-          platforms: linux/amd64
+          platforms: linux/amd64,linux/arm64/v8
           push: true
           tags: ${{ steps.debrid-meta.outputs.tags }}
           labels: ${{ steps.debrid-meta.outputs.labels }}
