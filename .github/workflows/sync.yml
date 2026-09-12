@@ -23,6 +23,6 @@ jobs:
         uses: aormsby/Fork-Sync-With-Upstream-action@v3.4
         with:
           upstream_sync_repo: alphasquare404/NuvioWeb
-          upstream_sync_branch: master
-          target_sync_branch: master
+          upstream_sync_branch: web
+          target_sync_branch: web
           target_repo_token: ${{ secrets.SYNC_TOKEN }}
