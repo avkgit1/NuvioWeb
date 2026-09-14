@@ -135,7 +135,7 @@ jobs:
         with:
           context: .
           file: ./services/external-return-bridge/Dockerfile
-          platforms: linux/amd64
+          platforms: linux/amd64,linux/arm64/v8
           push: true
           tags: ${{ steps.external-return-meta.outputs.tags }}
           labels: ${{ steps.external-return-meta.outputs.labels }}
