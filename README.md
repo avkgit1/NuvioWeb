@@ -63,6 +63,11 @@ Node.js, npm, or a local image build.
 
 ### Quick Deploy with Docker
 
+Quick Deploy requires an AMD64/x86_64 Linux host with Docker Engine, the Docker
+Compose plugin (`docker compose`), and `curl`. The current published container
+images are `linux/amd64`. You do not need Git, Node.js, npm, a source checkout,
+or a local image build.
+
 On the server, create an empty deployment directory and download the Compose
 file and configuration template:
 
@@ -87,6 +92,13 @@ docker compose pull
 docker compose up -d
 docker compose ps
 ```
+
+`docker compose ps` should show these four NuvioWeb services running:
+
+- `nuvioweb`
+- `nuvioweb-trakt-auth-bridge`
+- `nuvioweb-debrid-api-bridge`
+- `nuvioweb-external-return-bridge`
 
 Open `http://SERVER_IP:4173`. Set `NUVIO_PORT` in `.env` before starting if
 you need a different host port. You can also edit `.env` for Simkl, Premiumize,
@@ -121,7 +133,7 @@ private values in browser runtime configuration.
 ### Release Channels
 
 Use the default `:stable` tag for normal self-hosting. To switch channels, edit
-all three `image:` tags in `docker-compose.yml` to the same tag before pulling.
+all four `image:` tags in `docker-compose.yml` to the same tag before pulling.
 
 | Tag | Meaning |
 | --- | --- |
@@ -162,7 +174,7 @@ docker compose up -d
 With `:stable`, this updates to the newest official release. With `:nightly`,
 it updates to the newest `web` development build. With `:latest`, it updates to
 whichever project build was published most recently. A pinned tag such as
-`:0.1.0` remains pinned until you edit all three image tags manually.
+`:0.1.0` remains pinned until you edit all four image tags manually.
 
 ### Reverse Proxy
 
@@ -170,6 +182,10 @@ The container serves HTTP on port `80` and Compose maps it to host port `4173`.
 It can sit behind an external reverse proxy such as Nginx Proxy Manager, Caddy,
 or Traefik for HTTPS and a custom domain; TLS is intentionally not bundled into
 this application container.
+
+Use HTTPS in production for installed-PWA and Web Push features.
+Return-to-NuvioWeb notifications are optional; see
+[environment configuration](docs/environment.md) for setup and fallback behavior.
 
 ## Project Structure
 

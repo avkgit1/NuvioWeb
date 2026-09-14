@@ -53,6 +53,48 @@ backend.
 | `NUVIO_PORT`                  | Optional | Host-only Compose setting | `4173`                                              | Host port mapped to Nginx. Change it when `4173` is unavailable.                                                                                                                                                     |
 | `YOUTUBE_PROXY_URL`           | Optional | Browser-public            | `youtube-proxy.html`                                | Browser proxy helper path for YouTube-related playback. Empty disables that override.                                                                                                                                |
 
+### Return-to-NuvioWeb notifications (optional)
+
+This optional feature sends a notification after an external player reports
+playback progress or completion. Tapping it returns the user to the installed
+NuvioWeb PWA. It is a convenience only: external playback and external-return
+progress/completion reporting continue to work when notifications are not
+available.
+
+| Variable | Required | Visibility | Purpose and empty behavior |
+| --- | --- | --- | --- |
+| `NUVIO_WEB_PUSH_PUBLIC_KEY` | Optional | Browser-public | Public VAPID key used when a user enables return notifications. Empty leaves the feature unavailable. |
+| `NUVIO_WEB_PUSH_PRIVATE_KEY` | Optional | **Server-only** | Private VAPID key used only by `external-return-bridge` to send notifications. Never expose it to browser runtime configuration or logs. Empty leaves the feature unavailable. |
+| `NUVIO_WEB_PUSH_SUBJECT` | Optional | Server-only | VAPID contact URI, such as `mailto:admin@example.com` or a suitable HTTPS URI. Empty leaves the feature unavailable. |
+
+Generate a matching key pair on the self-host server:
+
+```bash
+npx --yes web-push@3.6.7 generate-vapid-keys
+```
+
+No separate global or manual `web-push` installation is required. If needed,
+`npx` downloads and runs `web-push@3.6.7`; `--yes` accepts that temporary
+installation without prompting. The command generates only a Public Key and
+Private Key. Copy them into `NUVIO_WEB_PUSH_PUBLIC_KEY` and
+`NUVIO_WEB_PUSH_PRIVATE_KEY`, respectively.
+Set `NUVIO_WEB_PUSH_SUBJECT` separately to a contact URI, such as
+`mailto:admin@example.com` or an appropriate HTTPS URI; the command does not
+generate the subject. Do not commit the real `.env` file or generated private
+key. The public VAPID key is intentionally browser-visible; the private key is
+not.
+
+Production Service Worker and Web Push use requires HTTPS. When using Nginx
+Proxy Manager, Caddy, Traefik, or another reverse proxy, access NuvioWeb via
+HTTPS before enabling Return-to-NuvioWeb notifications. Plain HTTP LAN access
+is not a production Web Push setup. Localhost development can be treated as a
+secure-context exception by browsers.
+
+If VAPID is not configured, permission is denied, Push is unsupported, a
+subscription is unavailable, or delivery fails, normal NuvioWeb usage and
+external playback still work. The callback/manual Home Screen return path stays
+available; only the notification-based return convenience is unavailable.
+
 ### Optional integrations
 
 | Variable               | Required | Visibility      | Default                     | Purpose and empty behavior                                                                                                                                                                    |
@@ -94,5 +136,5 @@ public runtime configuration:
 docker compose up -d --force-recreate
 ```
 
-Keep all three Docker `image:` tags in `docker-compose.yml` aligned when
+Keep all four Docker `image:` tags in `docker-compose.yml` aligned when
 switching between `stable`, `nightly`, `latest`, or a pinned `X.Y.Z` release.
