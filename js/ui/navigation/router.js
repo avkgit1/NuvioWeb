@@ -83,10 +83,43 @@ const NON_BACKSTACK_ROUTES = new Set([
 ]);
 
 const NUVIO_HISTORY_STATE_KEY = "__nuvioHistory";
+const DETAIL_SUSPEND_PARENT_ROUTES = new Set(["home", "search", "discover", "library", "folderDetail"]);
+
+function rememberInlineStyles(element, properties) {
+  return Object.fromEntries(
+    properties.map((property) => [property, element?.style?.getPropertyValue?.(property) || ""])
+  );
+}
+
+function restoreInlineStyles(element, styles = {}) {
+  Object.entries(styles || {}).forEach(([property, value]) => {
+    if (!element?.style) return;
+    if (value) element.style.setProperty(property, value);
+    else element.style.removeProperty(property);
+  });
+}
 
 function getNuvioHistoryIndex(state) {
   const value = state?.[NUVIO_HISTORY_STATE_KEY]?.index;
   return Number.isInteger(value) && value >= 0 ? value : null;
+}
+
+function getNuvioHistoryProvenance(state) {
+  const marker = state?.[NUVIO_HISTORY_STATE_KEY];
+  const index = getNuvioHistoryIndex(state);
+  const previousIndex = marker?.previousIndex;
+  const previousRoute = marker?.previousRoute;
+  if (
+    index == null ||
+    !Number.isInteger(previousIndex) ||
+    previousIndex < 0 ||
+    previousIndex !== index - 1 ||
+    typeof previousRoute !== "string" ||
+    !previousRoute
+  ) {
+    return null;
+  }
+  return { previousIndex, previousRoute };
 }
 
 export const Router = {
@@ -99,6 +132,9 @@ export const Router = {
   skipConsumeNextPopstate: false,
   ignoreNextPopstate: false,
   browserHistoryIndex: null,
+  browserHistoryProvenance: null,
+  suspendedDetailParent: null,
+  pendingPreviousRouteBack: null,
 
   routes: {
     home: HomeScreen,
@@ -198,6 +234,9 @@ export const Router = {
     if (this.popstateBound) {
       return;
     }
+    if (window?.history && "scrollRestoration" in window.history) {
+      window.history.scrollRestoration = "manual";
+    }
     this.popstateBound = true;
     window.addEventListener("popstate", async (event) => {
       if (this.ignoreNextPopstate) {
@@ -214,6 +253,7 @@ export const Router = {
       const hasValidHistoryTarget = Boolean(state?.route && this.routes[state.route]);
       const departingBrowserHistoryIndex = this.browserHistoryIndex;
       this.browserHistoryIndex = getNuvioHistoryIndex(state);
+      this.browserHistoryProvenance = getNuvioHistoryProvenance(state);
       const shouldSkipConsume = Boolean(this.skipConsumeNextPopstate);
       this.skipConsumeNextPopstate = false;
       const currentScreen = this.getCurrentScreen();
@@ -222,8 +262,13 @@ export const Router = {
         state?.route === "stream" &&
         currentScreen?.shouldReturnToStreamOnBack?.() !== false &&
         !currentScreen?.hasBackDismissableOverlay?.();
+      // Home uses Back to open/dismiss its sidebar, but that local behavior
+      // must not consume a valid Forward traversal into another Nuvio route.
+      const shouldSkipHomeForwardConsume = Boolean(
+        this.current === "home" && hasValidHistoryTarget && state.route !== this.current
+      );
       const consumeResult =
-        !shouldSkipConsume && !shouldLetPlayerReturnToStream
+        !shouldSkipConsume && !shouldLetPlayerReturnToStream && !shouldSkipHomeForwardConsume
           ? currentScreen?.consumeBackRequest?.({
               source: "popstate",
               hasValidHistoryTarget,
@@ -236,12 +281,20 @@ export const Router = {
           window?.history &&
           typeof window.history.pushState === "function"
         ) {
+          const previousIndex = this.browserHistoryIndex;
+          const previousRoute = hasValidHistoryTarget ? state.route : null;
           this.browserHistoryIndex = Math.max(0, Number(this.browserHistoryIndex || 0)) + 1;
+          this.browserHistoryProvenance = this.createBrowserHistoryProvenance(
+            previousIndex,
+            previousRoute
+          );
           window.history.pushState(this.createBrowserHistoryState(), "");
         }
+        this.settlePreviousRouteBack(false);
         return;
       }
       if (this.current === "home" && (!state?.route || NON_BACKSTACK_ROUTES.has(state.route))) {
+        this.settlePreviousRouteBack(false);
         return;
       }
       if (hasValidHistoryTarget) {
@@ -250,6 +303,10 @@ export const Router = {
           skipStackPush: true,
           isBackNavigation: true,
           captureHistoryIndex: departingBrowserHistoryIndex
+        });
+        this.settlePreviousRouteBack({
+          route: this.current,
+          index: this.browserHistoryIndex
         });
         return;
       }
@@ -264,6 +321,7 @@ export const Router = {
           }
         );
       }
+      this.settlePreviousRouteBack(false);
     });
   },
 
@@ -278,14 +336,82 @@ export const Router = {
     this.ignoreNextPopstate = true;
   },
 
-  createBrowserHistoryState(route = this.current, params = this.currentParams, index = this.browserHistoryIndex) {
+  createBrowserHistoryProvenance(previousIndex, previousRoute) {
+    return Number.isInteger(previousIndex) && previousIndex >= 0 && typeof previousRoute === "string" && previousRoute
+      ? { previousIndex, previousRoute }
+      : null;
+  },
+
+  createBrowserHistoryState(
+    route = this.current,
+    params = this.currentParams,
+    index = this.browserHistoryIndex,
+    provenance = this.browserHistoryProvenance
+  ) {
+    const marker = {
+      index: Number.isInteger(index) && index >= 0 ? index : 0
+    };
+    if (provenance) {
+      marker.previousIndex = provenance.previousIndex;
+      marker.previousRoute = provenance.previousRoute;
+    }
     return {
       route,
       params,
-      [NUVIO_HISTORY_STATE_KEY]: {
-        index: Number.isInteger(index) && index >= 0 ? index : 0
-      }
+      [NUVIO_HISTORY_STATE_KEY]: marker
     };
+  },
+
+  canBackToPreviousNuvioRoute(routeName) {
+    const provenance = this.browserHistoryProvenance;
+    return Boolean(
+      Platform.isBrowser() &&
+        this.historyInitialized &&
+        Number.isInteger(this.browserHistoryIndex) &&
+        provenance &&
+        provenance.previousRoute === routeName &&
+        provenance.previousIndex === this.browserHistoryIndex - 1
+    );
+  },
+
+  backToPreviousNuvioRoute(routeName) {
+    if (
+      this.pendingPreviousRouteBack ||
+      !this.canBackToPreviousNuvioRoute(routeName) ||
+      !window?.history ||
+      typeof window.history.back !== "function"
+    ) {
+      return { accepted: false, settled: Promise.resolve(false) };
+    }
+    let resolve;
+    const settled = new Promise((done) => {
+      resolve = done;
+    });
+    this.pendingPreviousRouteBack = {
+      expectedRoute: routeName,
+      expectedIndex: this.browserHistoryProvenance.previousIndex,
+      resolve
+    };
+    try {
+      window.history.back();
+      return { accepted: true, settled };
+    } catch (_) {
+      this.settlePreviousRouteBack(false);
+      return { accepted: false, settled: Promise.resolve(false) };
+    }
+  },
+
+  settlePreviousRouteBack(result = false) {
+    const pending = this.pendingPreviousRouteBack;
+    if (!pending) return;
+    this.pendingPreviousRouteBack = null;
+    pending.resolve(
+      Boolean(
+        result &&
+          result.route === pending.expectedRoute &&
+          result.index === pending.expectedIndex
+      )
+    );
   },
 
   hasPreviousBrowserHistoryEntry() {
@@ -293,6 +419,91 @@ export const Router = {
       && this.historyInitialized
       && Number.isInteger(this.browserHistoryIndex)
       && this.browserHistoryIndex > 0;
+  },
+
+  suspendCurrentParentForDetail() {
+    if (!Platform.isBrowser() || !DETAIL_SUSPEND_PARENT_ROUTES.has(this.current)) {
+      return false;
+    }
+    const parentScreen = this.routes[this.current];
+    const parentContainer = parentScreen?.container || document?.getElementById?.(this.current);
+    const detailContainer = document?.getElementById?.("detail");
+    if (!parentScreen || !parentContainer || !detailContainer) {
+      return false;
+    }
+    const documentElement = document.documentElement;
+    const body = document.body;
+    this.suspendedDetailParent = {
+      route: this.current,
+      params: this.currentParams,
+      historyIndex: this.browserHistoryIndex,
+      screen: parentScreen,
+      parentContainer,
+      parentInert: Boolean(parentContainer.inert),
+      parentAriaHidden: parentContainer.getAttribute?.("aria-hidden"),
+      detailContainer,
+      detailStyles: rememberInlineStyles(detailContainer, [
+        "position", "inset", "z-index", "overflow-y", "overscroll-behavior", "background"
+      ]),
+      documentStyles: rememberInlineStyles(documentElement, ["overflow"]),
+      bodyStyles: rememberInlineStyles(body, ["overflow"])
+    };
+    parentContainer.inert = true;
+    parentContainer.setAttribute?.("aria-hidden", "true");
+    documentElement?.style?.setProperty("overflow", "hidden");
+    body?.style?.setProperty("overflow", "hidden");
+    detailContainer.style.setProperty("position", "fixed");
+    detailContainer.style.setProperty("inset", "0");
+    detailContainer.style.setProperty("z-index", "1000");
+    detailContainer.style.setProperty("overflow-y", "auto");
+    detailContainer.style.setProperty("overscroll-behavior", "contain");
+    detailContainer.style.setProperty("background", "var(--bg-color)");
+    return true;
+  },
+
+  releaseSuspendedDetailParent({ cleanup = false } = {}) {
+    const suspended = this.suspendedDetailParent;
+    if (!suspended) return null;
+    this.suspendedDetailParent = null;
+    const { parentContainer, detailContainer } = suspended;
+    if (parentContainer) {
+      parentContainer.inert = Boolean(suspended.parentInert);
+      if (suspended.parentAriaHidden == null) parentContainer.removeAttribute?.("aria-hidden");
+      else parentContainer.setAttribute?.("aria-hidden", suspended.parentAriaHidden);
+    }
+    restoreInlineStyles(detailContainer, suspended.detailStyles);
+    restoreInlineStyles(document.documentElement, suspended.documentStyles);
+    restoreInlineStyles(document.body, suspended.bodyStyles);
+    if (cleanup) suspended.screen?.cleanup?.();
+    return suspended;
+  },
+
+  canResumeSuspendedDetailParent(routeName, options = {}) {
+    const suspended = this.suspendedDetailParent;
+    return Boolean(
+      suspended &&
+        routeName === suspended.route &&
+        (options?.fromHistory || options?.isBackNavigation) &&
+        Number.isInteger(this.browserHistoryIndex) &&
+        this.browserHistoryIndex === suspended.historyIndex
+    );
+  },
+
+  async resumeSuspendedDetailParent(routeName, params, options, previousRoute) {
+    const suspended = this.releaseSuspendedDetailParent();
+    this.routes[previousRoute]?.cleanup?.();
+    this.current = routeName;
+    this.currentParams = params || {};
+    setBrowserRouteTitle(routeName);
+    if (suspended?.parentContainer?.style) {
+      suspended.parentContainer.style.display = "block";
+    }
+    const pullRefreshHandler = Platform.isBrowser()
+      ? getBrowserPullRefreshHandler(routeName, this.routes[routeName])
+      : null;
+    if (pullRefreshHandler) {
+      this.browserPullToRefreshCleanup = bindBrowserPullToRefresh({ onRefresh: pullRefreshHandler });
+    }
   },
 
   async navigate(routeName, params = {}, options = {}) {
@@ -315,14 +526,26 @@ export const Router = {
       bootGuard.stage(`Opening ${routeName} screen`);
     }
 
-    // Cleanup current
     const previousRoute = this.current;
+    if (this.canResumeSuspendedDetailParent(routeName, options)) {
+      await this.resumeSuspendedDetailParent(routeName, targetParams, options, previousRoute);
+      this.settlePreviousRouteBack({ route: this.current, index: this.browserHistoryIndex });
+      return;
+    }
+    if (previousRoute === "detail" && this.suspendedDetailParent) {
+      this.releaseSuspendedDetailParent({ cleanup: true });
+    }
+
+    // Cleanup current
     const shouldSkipPush = skipStackPush || NON_BACKSTACK_ROUTES.has(previousRoute);
     this.browserPullToRefreshCleanup?.();
     this.browserPullToRefreshCleanup = null;
     if (this.current && this.current !== routeName) {
       this.captureCurrentRouteState(routeName, options?.captureHistoryIndex);
-      this.routes[this.current].cleanup?.();
+      const suspendParent = routeName === "detail" && this.suspendCurrentParentForDetail();
+      if (!suspendParent) {
+        this.routes[this.current].cleanup?.();
+      }
       if (!shouldSkipPush) {
         this.stack.push({
           route: this.current,
@@ -374,6 +597,7 @@ export const Router = {
     if (window?.history && typeof window.history.pushState === "function") {
       if (!this.historyInitialized) {
         this.browserHistoryIndex = getNuvioHistoryIndex(window.history.state) ?? 0;
+        this.browserHistoryProvenance = null;
         const state = this.createBrowserHistoryState();
         window.history.replaceState(state, "");
         this.historyInitialized = true;
@@ -383,7 +607,12 @@ export const Router = {
           const state = this.createBrowserHistoryState();
           window.history.replaceState(state, "");
         } else {
+          const previousIndex = this.browserHistoryIndex;
           this.browserHistoryIndex = Math.max(0, Number(this.browserHistoryIndex || 0)) + 1;
+          this.browserHistoryProvenance = this.createBrowserHistoryProvenance(
+            previousIndex,
+            previousRoute
+          );
           const state = this.createBrowserHistoryState();
           window.history.pushState(state, "");
         }
