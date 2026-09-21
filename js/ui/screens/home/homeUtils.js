@@ -131,3 +131,41 @@ export function parseCssPx(value, fallback = 0) {
   const parsed = parseFloat(String(value || "").trim());
   return Number.isFinite(parsed) ? parsed : fallback;
 }
+
+/**
+ * The episode still a Continue Watching card may use.
+ *
+ * Only a series has one. A film reaching this chain would fall through to
+ * `thumbnail`, which enrichment fills from the poster whenever a title has no
+ * landscape still of its own -- and the Use Episode Thumbnails preference puts
+ * this value first, so a portrait poster ended up stretched across a landscape
+ * card whenever that preference was on.
+ */
+export function resolveContinueWatchingEpisodeStill(item = {}, isSeries = false) {
+  if (!isSeries) {
+    return "";
+  }
+  return firstNonEmpty(
+    item?.episodeThumbnail,
+    item?.thumbnail,
+    item?.backdrop,
+    item?.background,
+    item?.poster
+  );
+}
+
+/**
+ * Whether a Continue Watching card should render its progress element at all.
+ *
+ * A Next Up card is the next episode you have not started, so it is built with
+ * `progressFraction: 0` deliberately. The track is the visible part of the bar
+ * -- the inner span is only the fill -- so emitting it at 0% drew an empty bar
+ * across a card that has no playback behind it.
+ *
+ * Only Next Up is excluded. A normal Continue Watching item keeps exactly what
+ * it renders today, including the case where its fraction is 0 because the
+ * duration is not known yet; that is not this rule's business.
+ */
+export function shouldRenderContinueWatchingProgress(item = {}) {
+  return !item?.isNextUp;
+}

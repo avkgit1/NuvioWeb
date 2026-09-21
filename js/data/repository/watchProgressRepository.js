@@ -2,6 +2,8 @@ import { WatchProgressStore } from "../local/watchProgressStore.js";
 import { ProfileManager } from "../../core/profile/profileManager.js";
 import { LocalStore } from "../../core/storage/localStore.js";
 import { ContinueWatchingPreferences } from "../local/continueWatchingPreferences.js";
+import { watchProgressOwner } from "./watchProgressProvenance.js";
+import { continueWatchingRemovalSuppression } from "./continueWatchingRemovalSuppression.js";
 import {
   TraktSettingsStore,
   WatchProgressSource,
@@ -12,14 +14,16 @@ import { TraktAuthService } from "./traktAuthService.js";
 import { SimklAuthStore } from "../local/simklAuthStore.js";
 import { SimklSyncService } from "./simklSyncService.js";
 import { metaRepository } from "./metaRepository.js";
+import {
+  deduplicateContinueWatchingItems,
+  isSeriesType,
+  shouldTreatAsInProgressForContinueWatching
+} from "./continueWatchingDeduplication.js";
 import { mapWithConcurrency } from "../../core/network/mapWithConcurrency.js";
 import {
   WATCH_PROGRESS_COMPLETED_THRESHOLD,
   WATCH_PROGRESS_STARTED_THRESHOLD,
   getWatchProgressFraction,
-  hasWatchProgressStarted,
-  isWatchProgressCompleted,
-  isWatchProgressInProgress,
   resolveWatchProgressResumePositionMs
 } from "../../domain/model/watchProgress.js";
 
@@ -135,9 +139,7 @@ function patchOrInvalidateContinueWatchingDisplaySnapshot(progressItem) {
   if (!entry || !Array.isArray(entry.items)) {
     return;
   }
-  const index = entry.items.findIndex(
-    (item) => continueWatchingSnapshotItemKey(item) === itemKey
-  );
+  const index = entry.items.findIndex((item) => continueWatchingSnapshotItemKey(item) === itemKey);
   if (index === -1) {
     return;
   }
@@ -147,11 +149,6 @@ function patchOrInvalidateContinueWatchingDisplaySnapshot(progressItem) {
   nextItems[index] = { ...nextItems[index], positionMs, durationMs };
   const nextStore = { ...store, [sourceKey]: { ...entry, items: nextItems } };
   LocalStore.set(CW_DISPLAY_SNAPSHOT_KEY, nextStore);
-}
-
-function isSeriesType(type) {
-  const normalized = String(type || "").toLowerCase();
-  return normalized === "series" || normalized === "tv";
 }
 
 function matchesProgressTarget(item = {}, contentId, videoId = null) {
@@ -179,34 +176,12 @@ async function deleteWatchProgressFromCloud(items = []) {
   }
 }
 
-function isCompletedForContinueWatching(item = {}) {
-  return isWatchProgressCompleted(item);
-}
-
-function isInProgressForContinueWatching(item = {}) {
-  return isWatchProgressInProgress(item);
-}
-
-function shouldTreatAsInProgressForContinueWatching(item = {}) {
-  if (isInProgressForContinueWatching(item)) {
-    return true;
-  }
-  if (isCompletedForContinueWatching(item)) {
-    return false;
-  }
-  return hasWatchProgressStarted(item);
-}
-
 function isTraktProgressItem(item = {}) {
-  return String(item.source || "")
-    .toLowerCase()
-    .startsWith("trakt");
+  return watchProgressOwner(item) === WatchProgressSource.TRAKT;
 }
 
 function isSimklProgressItem(item = {}) {
-  return String(item.source || "")
-    .toLowerCase()
-    .startsWith("simkl");
+  return watchProgressOwner(item) === WatchProgressSource.SIMKL;
 }
 
 function isTraktCompatibleContentId(contentId) {
@@ -261,40 +236,6 @@ function filterForSelectedContinueWatchingSource(items = []) {
     );
   }
   return all.filter((item) => !isTraktProgressItem(item) && !isSimklProgressItem(item));
-}
-
-function deduplicateInProgress(items = []) {
-  const nonSeriesItems = [];
-  const latestSeriesItems = [];
-  const seenContentIds = new Set();
-
-  (Array.isArray(items) ? items : [])
-    .slice()
-    .sort((left, right) => Number(right.updatedAt || 0) - Number(left.updatedAt || 0))
-    .forEach((item) => {
-      if (!isSeriesType(item?.contentType)) {
-        if (shouldTreatAsInProgressForContinueWatching(item)) {
-          nonSeriesItems.push(item);
-        }
-        return;
-      }
-
-      const contentId = String(item?.contentId || "").trim();
-      if (!contentId || seenContentIds.has(contentId)) {
-        return;
-      }
-      seenContentIds.add(contentId);
-      // Decide Continue Watching eligibility only after selecting the newest
-      // episode state for the series. Otherwise a completed episode is removed
-      // first and an older partial record can reappear beside the real Next Up.
-      if (shouldTreatAsInProgressForContinueWatching(item)) {
-        latestSeriesItems.push(item);
-      }
-    });
-
-  return [...nonSeriesItems, ...latestSeriesItems].sort(
-    (left, right) => Number(right.updatedAt || 0) - Number(left.updatedAt || 0)
-  );
 }
 
 function normalizeContentIdList(values = []) {
@@ -438,6 +379,8 @@ function toProgressItemFromPlayback(playbackItem) {
     imdbId: playbackItem.imdbId,
     tmdbId: playbackItem.tmdbId || null,
     traktId: playbackItem.traktId || null,
+    // Kept so a removal can delete the right remote playback entry.
+    traktPlaybackId: playbackItem.traktPlaybackId ?? null,
     source: "trakt_playback",
     updatedAt: pausedAtMs,
     positionMs: 0,
@@ -612,6 +555,27 @@ async function batchEnrichProgressItems(items) {
   });
 }
 
+// Deletes the Trakt playback entries backing a title. Playback only: Trakt
+// watched history lives behind /sync/history and is never touched here.
+async function removeTraktPlaybackForContent(contentId) {
+  const wanted = String(contentId || "").trim();
+  if (!wanted) return { attempted: 0, deleted: 0, failed: 0 };
+  const snapshot = await fetchTraktProgressSnapshot();
+  const ids = Array.from(
+    new Set(
+      (snapshot.playbackItems || [])
+        .filter((item) => String(item?.contentId || "").trim() === wanted)
+        .map((item) => Number(item?.traktPlaybackId))
+        .filter((id) => Number.isFinite(id) && id > 0)
+    )
+  );
+  if (!ids.length) return { attempted: 0, deleted: 0, failed: 0 };
+  const result = await TraktAuthService.removePlaybackEntries(ids);
+  // Force the next compose to ask Trakt again rather than reuse the cache.
+  traktProgressSnapshotCache = null;
+  return result;
+}
+
 class WatchProgressRepository {
   async saveProgress(progress, { authoritative = false } = {}) {
     if (isSeriesType(progress?.contentType)) {
@@ -645,9 +609,7 @@ class WatchProgressRepository {
     const localItems = WatchProgressStore.listForProfile(activeProfileId());
     let sourceItems = filterForSelectedContinueWatchingSource(localItems);
 
-    if (
-      selectedContinueWatchingSource() !== WatchProgressSource.NUVIO_SYNC
-    ) {
+    if (selectedContinueWatchingSource() !== WatchProgressSource.NUVIO_SYNC) {
       sourceItems = await this.getRecent(300, { enrichMetadata: false }).catch((error) => {
         console.warn("[CW] Resume lookup failed", error);
         return sourceItems;
@@ -744,7 +706,7 @@ class WatchProgressRepository {
       .sort((left, right) => Number(right.updatedAt || 0) - Number(left.updatedAt || 0))
       .slice(0, 300);
 
-    const inProgressOnly = deduplicateInProgress(recentItems);
+    const inProgressOnly = deduplicateContinueWatchingItems(recentItems);
 
     const limitedItems = inProgressOnly.slice(0, limit);
     return enrichMetadata ? batchEnrichProgressItems(limitedItems) : limitedItems;
@@ -763,12 +725,23 @@ class WatchProgressRepository {
       selectedContinueWatchingSource() === WatchProgressSource.TRAKT
         ? await fetchTraktProgressSnapshot()
         : await fetchSimklProgressSnapshot();
-    return filterForSelectedContinueWatchingSource([
-      ...localItems,
-      ...snapshot.historyItems,
-      ...snapshot.playbackItems,
-      ...snapshot.watchedShowSeedItems
-    ]);
+    // A suppression only means something against the account it was made for,
+    // so drop the set outright when the profile or source changes.
+    continueWatchingRemovalSuppression.scopeTo(this.getContinueWatchingSourceKey());
+    // Settle any in-flight removal against what the provider now reports.
+    // Only the playback rows matter here: those are what a removal deletes,
+    // and a lingering history row must not keep a card hidden.
+    continueWatchingRemovalSuppression.reconcile(
+      (snapshot.playbackItems || []).map((item) => item?.contentId)
+    );
+    return continueWatchingRemovalSuppression.filterItems(
+      filterForSelectedContinueWatchingSource([
+        ...localItems,
+        ...snapshot.historyItems,
+        ...snapshot.playbackItems,
+        ...snapshot.watchedShowSeedItems
+      ])
+    );
   }
 
   getContinueWatchingSourceKey() {
@@ -777,6 +750,90 @@ class WatchProgressRepository {
 
   getContinueWatchingSource() {
     return selectedContinueWatchingSource();
+  }
+
+  /**
+   * Re-read the selected source now, ignoring the usual pacing.
+   *
+   * Continue Watching normally re-checks its source on a timer, which is right
+   * for ordinary navigation but wrong for an explicit pull-to-refresh: the user
+   * is standing in front of the app asking for the newest state, and being told
+   * "checked recently, come back later" makes the gesture look broken.
+   *
+   * Nuvio Sync needs this as much as a tracking provider does. Its state is
+   * local, but playback recorded in another app reaches that local store only
+   * through a cloud pull, and nothing was forcing one -- so a pull-to-refresh
+   * showed the same rows until the background cycle came round on its own.
+   */
+  async forceRefreshSelectedSource() {
+    const source = selectedContinueWatchingSource();
+    if (source === WatchProgressSource.SIMKL && SimklAuthStore.isAuthenticated()) {
+      await SimklSyncService.refresh({ force: true, rereadPlayback: true }).catch(() => false);
+      return true;
+    }
+    if (source === WatchProgressSource.TRAKT && TraktAuthStore.isAuthenticated()) {
+      traktProgressSnapshotCache = null;
+      return true;
+    }
+    // Imported here because the sync services import this module in turn.
+    const [{ WatchProgressSyncService }, { WatchedItemsSyncService }] = await Promise.all([
+      import("../../core/profile/watchProgressSyncService.js"),
+      import("../../core/profile/watchedItemsSyncService.js")
+    ]);
+    // Watched items travel with progress: they decide which Next Up card a
+    // finished episode leaves behind.
+    await Promise.all([
+      WatchProgressSyncService.pull().catch(() => []),
+      WatchedItemsSyncService.pull().catch(() => [])
+    ]);
+    return true;
+  }
+
+  /**
+   * Remove a title from Continue Watching everywhere it is represented.
+   *
+   * Title-wide by decision: removing a series removes its progress, not only
+   * the episode whose card was used. Watched/history records are never
+   * touched -- only playback/progress rows -- so removing a card from
+   * Continue Watching can never silently un-watch anything.
+   *
+   * A provider-backed row is not stored locally, so deleting it is a network
+   * round trip. The title is suppressed from the projection meanwhile, and
+   * that suppression is settled by a later snapshot rather than by the call
+   * appearing to succeed.
+   */
+  async removeContinueWatchingTitle(contentId) {
+    const normalizedContentId = String(contentId || "").trim();
+    if (!normalizedContentId) {
+      return false;
+    }
+    await this.removeProgress(normalizedContentId);
+
+    const source = selectedContinueWatchingSource();
+    const removeRemote =
+      source === WatchProgressSource.SIMKL && SimklAuthStore.isAuthenticated()
+        ? () => SimklSyncService.removePlaybackForContent(normalizedContentId)
+        : source === WatchProgressSource.TRAKT && TraktAuthStore.isAuthenticated()
+          ? () => removeTraktPlaybackForContent(normalizedContentId)
+          : null;
+    if (!removeRemote) {
+      return true;
+    }
+
+    continueWatchingRemovalSuppression.scopeTo(this.getContinueWatchingSourceKey());
+    continueWatchingRemovalSuppression.suppress(normalizedContentId);
+    const result = await removeRemote().catch(() => ({
+      attempted: 0,
+      deleted: 0,
+      failed: 1
+    }));
+    // Nothing was deleted and the provider rejected us: let the card come
+    // back rather than leave a removal that never actually happened.
+    if (result.deleted === 0 && result.failed > 0) {
+      continueWatchingRemovalSuppression.release(normalizedContentId);
+    }
+    invalidateContinueWatchingDisplaySnapshot();
+    return true;
   }
 
   async replaceAll(items, profileId = activeProfileId()) {
