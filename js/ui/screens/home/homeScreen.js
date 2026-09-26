@@ -159,6 +159,7 @@ import {
   formatCatalogRowTitle,
   limitTextToWordCount,
   parseCssPx,
+  continueWatchingProgressFraction,
   prettyId,
   resolveContinueWatchingEpisodeStill,
   shouldRenderContinueWatchingProgress,
@@ -1081,24 +1082,6 @@ function getContinueWatchingMetaTimeout(timeoutMs) {
   return requestedTimeout;
 }
 
-function progressFractionForContinueWatching(item = {}) {
-  const explicitPercent = Number(item.progressPercent);
-  if (Number.isFinite(explicitPercent) && explicitPercent > 0) {
-    return Math.max(0, Math.min(1, explicitPercent / 100));
-  }
-  const durationMs = Number(item.durationMs || 0);
-  const positionMs = Number(item.positionMs || 0);
-  if (
-    !Number.isFinite(durationMs) ||
-    durationMs <= 0 ||
-    !Number.isFinite(positionMs) ||
-    positionMs <= 0
-  ) {
-    return 0;
-  }
-  return Math.max(0, Math.min(1, positionMs / durationMs));
-}
-
 function isSeriesTypeForContinueWatching(type) {
   const normalized = String(type || "").toLowerCase();
   return ["series", "tv", "anime"].includes(normalized);
@@ -1110,11 +1093,11 @@ function isPosterWatchedType(type) {
 }
 
 function isCompletedForContinueWatching(item = {}) {
-  return progressFractionForContinueWatching(item) >= CW_PROGRESS_END_THRESHOLD;
+  return continueWatchingProgressFraction(item) >= CW_PROGRESS_END_THRESHOLD;
 }
 
 function isInProgressForContinueWatching(item = {}) {
-  const fraction = progressFractionForContinueWatching(item);
+  const fraction = continueWatchingProgressFraction(item);
   return fraction >= CW_PROGRESS_START_THRESHOLD && fraction < CW_PROGRESS_END_THRESHOLD;
 }
 
@@ -1467,7 +1450,7 @@ function buildProgressFraction(item) {
   if (item?.isNextUp) {
     return 0;
   }
-  return progressFractionForContinueWatching(item);
+  return continueWatchingProgressFraction(item);
 }
 
 function buildCatalogLoadingItems(rowKey, count = HOME_LOADING_ROW_ITEMS_DEFAULT) {
@@ -8981,6 +8964,25 @@ export const HomeScreen = {
         return;
       }
 
+      // The positions are already in hand: they came out of the store above.
+      // Only artwork and Next-Up resolution need the network, and waiting for
+      // that whole pipeline before painting anything is why a card sat on its
+      // old position for about five seconds after a pull-to-refresh -- a
+      // each item's metadata lookup is allowed CW_META_TIMEOUT_MS and each
+      // Next-Up candidate CW_NEXT_UP_META_TIMEOUT_MS, and they add up.
+      //
+      // Patching only touches position and duration on a card that is already
+      // resolved and showing, so it cannot reorder the row, invent a card, or
+      // guess a Next-Up episode. The full pass below still decides all of that.
+      const patchedDisplay = this.continueWatching.reduce(
+        (display, item) => patchContinueWatchingDisplayProgress(display, item) || display,
+        this.continueWatchingDisplay
+      );
+      if (patchedDisplay !== this.continueWatchingDisplay) {
+        this.continueWatchingDisplay = patchedDisplay;
+        this.requestBackgroundRender();
+      }
+
       const enriched = await this.enrichContinueWatching(this.continueWatching, {
         allProgress: this.allProgress,
         watchedItems: this.getContinueWatchingWatchedItems(),
@@ -9486,6 +9488,28 @@ export const HomeScreen = {
         }
 
         try {
+          // The snapshot painted a moment ago carries the positions it was
+          // saved with, and the fresh ones are already in hand from the store
+          // read above. Only artwork and Next-Up resolution need the network,
+          // so waiting for that whole pipeline before correcting a number we
+          // already know is what left the row showing the previous session's
+          // position for several seconds after opening the app.
+          //
+          // The same patch the store refresh does, on the path that actually
+          // runs at startup. It touches only position and duration on a card
+          // already resolved and showing, so it cannot reorder the row, invent
+          // a card, or guess a Next-Up episode; the full pass below still
+          // decides all of that. On a cold start the display is empty and this
+          // is a no-op, which is what the progressive reveal below is for.
+          const patchedFromStore = (this.continueWatching || []).reduce(
+            (display, item) => patchContinueWatchingDisplayProgress(display, item) || display,
+            this.continueWatchingDisplay
+          );
+          if (patchedFromStore !== this.continueWatchingDisplay) {
+            this.continueWatchingDisplay = patchedFromStore;
+            this.requestBackgroundRender();
+          }
+
           // On a true cold start (no snapshot to paint from), reveal each
           // in-progress card as its own enrichment resolves instead of
           // waiting for the whole batch (which can legitimately take several
