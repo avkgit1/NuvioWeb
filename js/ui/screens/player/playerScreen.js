@@ -19,7 +19,6 @@ import {
   normalizeAddonLogoUrl,
   requestAddonLogo
 } from "../../../core/media/addonLogoCache.js";
-import { localMediaSubtitleRepository } from "../../../data/repository/localMediaSubtitleRepository.js";
 import { subtitleRepository } from "../../../data/repository/subtitleRepository.js";
 import { streamRepository } from "../../../data/repository/streamRepository.js";
 import { addonRepository } from "../../../data/repository/addonRepository.js";
@@ -94,7 +93,6 @@ import {
   shouldBlurBrowserPlayerToolbarAfterPointer
 } from "./playerBrowserShortcutRouting.js";
 import {
-  buildHtmlSubtitleCue,
   getSubtitleAssAlignment,
   getSubtitleAssAlignmentSettings,
   parseVttCueLayout
@@ -550,7 +548,7 @@ function getTrackMetadataStrings(track = {}) {
   return values;
 }
 
-function getAudioTrackSupportState(track = {}) {
+function getAudioTrackSupportState(_track = {}) {
   return {
     supported: true,
     unsupportedReason: null
@@ -1386,20 +1384,6 @@ function formatBytes(value) {
   }
   const precision = amount >= 10 || unitIndex === 0 ? 0 : 1;
   return `${amount.toFixed(precision)} ${units[unitIndex]}`;
-}
-
-function formatBytesPerSecond(value) {
-  const bytesPerSecond = Number(value || 0);
-  if (!Number.isFinite(bytesPerSecond) || bytesPerSecond <= 0) {
-    return "";
-  }
-  if (bytesPerSecond >= 1_048_576) {
-    return `${(bytesPerSecond / 1_048_576).toFixed(1)} MB/s`;
-  }
-  if (bytesPerSecond >= 1_024) {
-    return `${Math.round(bytesPerSecond / 1_024)} KB/s`;
-  }
-  return `${Math.round(bytesPerSecond)} B/s`;
 }
 
 function normalizeStreamBadgeChipColor(value = "") {
@@ -2407,7 +2391,7 @@ export const PlayerScreen = {
       this.enableStartupAudioGate({
         allowPlayback: allowPlaybackDuringStartupAudioGate
       });
-      const playbackStartPromise = this.startPlayerControllerPlayback(
+      void this.startPlayerControllerPlayback(
         this.activePlaybackUrl,
         this.buildPlaybackContext(sourceCandidate),
         { mountToken, sourceCandidate }
@@ -4655,12 +4639,14 @@ export const PlayerScreen = {
   async launchExternalPlayer(player) {
     const context = this.getExternalPlayerContext();
     if (!context) return false;
-    const progressMode =
-      PlayerSettingsStore.get().externalPlayerProgress === "manual" ? "manual" : "automatic";
+    const settings = PlayerSettingsStore.get();
+    const progressMode = settings.externalPlayerProgress === "manual" ? "manual" : "automatic";
+    const returnMethod = settings.externalReturnMethod;
     const prepared = prepareBrowserExternalPlaybackLaunch({
       player,
       platform: getBrowserExternalPlayerPlatform(),
       progressMode,
+      returnMethod,
       resumePositionSeconds: this.getExternalPlayerResumeSeconds(),
       knownDurationMs: this.getExternalPlayerKnownDurationMs(),
       progressContext: PlayerController.createProgressContext?.(),
@@ -4674,7 +4660,14 @@ export const PlayerScreen = {
     }
     // Return notifications are optional: the binding helper resolves false on
     // unsupported, unavailable, or failed Push paths and must not alter launch.
-    await bindBrowserPushReturn({ token: prepared.handoff?.token });
+    // An Automation already brings the person back, so asking the relay for a
+    // notification too would arrive for an app they are already looking at.
+    // The subscription itself is left alone: it carries every other
+    // notification the app sends, so cancelling it here would cost more than
+    // this one message is worth.
+    if (returnMethod !== "automation") {
+      await bindBrowserPushReturn({ token: prepared.handoff?.token });
+    }
     launchBrowserExternalPlayer({ href: prepared.launch.href });
     return true;
   },
@@ -7191,7 +7184,17 @@ export const PlayerScreen = {
     this.playerBackNavigationInProgress = true;
     Router.suppressNextPopstate?.(1500);
     Router.ignoreSinglePopstate?.();
-    const targetRoute = shouldReturnToStream ? "stream" : this.params?.itemId ? "detail" : "home";
+    // The stream route tells this player where Back belongs when its list was
+    // never shown. Continue Watching says Home, because the Detail it passed
+    // through was replaced on the way in and no longer exists to return to.
+    const handoffReturn = String(this.params?.handoffReturnRoute || "").trim();
+    const targetRoute = shouldReturnToStream
+      ? "stream"
+      : handoffReturn === "home" || handoffReturn === "detail"
+        ? handoffReturn
+        : this.params?.itemId
+          ? "detail"
+          : "home";
     const targetParams =
       targetRoute === "stream"
         ? streamParams
@@ -8591,6 +8594,17 @@ export const PlayerScreen = {
         detailErrorCode || Number(video?.error?.code || 0) || controllerErrorCode;
       const eventDetail = event?.detail && typeof event.detail === "object" ? event.detail : {};
       const playbackErrorDetail = this.getPlaybackEventErrorDetail(eventDetail);
+      // The source this failure belongs to. Every message below reports it, and
+      // it was referenced here without ever being declared -- so each branch
+      // threw at its first mention instead of showing anything. This handler is
+      // async, which is why that was silent: the ReferenceError became an
+      // unhandled rejection, so a failed stream produced no startup error, no
+      // sources error and no offer to choose another source. It just hung.
+      //
+      // Resolved the way playStreamByUrl resolves it, so the message names the
+      // same source the player was actually playing.
+      const currentSourceCandidate =
+        this.getStreamCandidateByUrl(this.activePlaybackUrl) || this.getCurrentStreamCandidate();
       const terminalHlsHttpFailure = isTerminalHlsHttpStatus(eventDetail.hlsResponseCode);
       if (
         !this.hasPresentedPlaybackFrame &&
@@ -10467,7 +10481,6 @@ export const PlayerScreen = {
       resetSilentAudioState = true,
       preservePlaybackState = false,
       preservePendingRestore = false,
-      preserveStartupRecoveryState = false,
       forceEngine = null,
       sourceCandidate: explicitSourceCandidate = null,
       mountToken = null

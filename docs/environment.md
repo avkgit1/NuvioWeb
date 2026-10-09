@@ -95,6 +95,32 @@ subscription is unavailable, or delivery fails, normal NuvioWeb usage and
 external playback still work. The callback/manual Home Screen return path stays
 available; only the notification-based return convenience is unavailable.
 
+### Return to NuvioWeb by Shortcuts Automation (optional, iPhone)
+
+On iPhone and iPad an alternative to the notification above is a Shortcuts
+Automation: it runs when the external player closes and opens NuvioWeb, so
+progress is collected without anything to tap. It needs no relay, no keys and
+no subscription.
+
+The Shortcut itself is two actions — Open URL, pointing at
+`webapp://<your host>/`, the scheme that opens a web app already added to the
+Home Screen on iOS 16.4 and later. **A Shortcut therefore carries the address
+it opens**, so a Shortcut published for one deployment opens that deployment
+on anyone's phone.
+
+| Variable | Required | Visibility | Default | Purpose and empty behavior |
+| --- | --- | --- | --- | --- |
+| `AUTOMATION_SHORTCUT_URL` | Optional | Browser-public | Empty | An iCloud link to a Shortcut you published **for your own domain**. When set, iPhone users get a one-tap Add the Shortcut button. Empty shows them the address for this deployment and how to paste it into a new Shortcut, which always works. |
+
+Leave it empty unless you published your own. Never copy another deployment's
+link: your users would install a Shortcut that opens someone else's instance.
+
+To publish one: build a Shortcut with a single Open URL action set to
+`webapp://<your host>/`, then Share it and choose Copy iCloud Link.
+
+The option is offered only on iOS, and only once NuvioWeb is installed to the
+Home Screen — the Shortcut has nothing to open until then.
+
 ### Optional integrations
 
 | Variable               | Required | Visibility      | Default                     | Purpose and empty behavior                                                                                                                                                                    |
@@ -102,8 +128,8 @@ available; only the notification-based return convenience is unavailable.
 | `SIMKL_CLIENT_ID`      | Optional | Browser-public  | Empty                       | Enables Simkl integration when configured. Obtain the public client identifier from [Simkl API documentation](https://api.simkl.com/). Empty leaves Simkl unavailable.                        |
 | `SIMKL_APP_NAME`       | Optional | Browser-public  | `nuvio`                     | Display/application name passed to Simkl. Leave the default unless your Simkl registration requires another value.                                                                            |
 | `PREMIUMIZE_CLIENT_ID` | Optional | Browser-public  | Empty                       | Enables Premiumize Device Code authentication. Register an OAuth client through [Premiumize API documentation](https://www.premiumize.me/api). Empty keeps Premiumize connection unavailable. |
-| `TRAKT_CLIENT_ID`      | Optional | Browser-public  | Empty                       | Public Trakt application identifier for browser sign-in. Obtain it from the [Trakt application settings](https://app.trakt.tv/settings/apps). Empty keeps Trakt sign-in unavailable.          |
-| `TRAKT_CLIENT_SECRET`  | Optional | **Server-only** | Empty                       | Private Trakt application credential. It is passed only to `trakt-auth-bridge`, never written to `nuvio.env.js` or exposed to browser JavaScript. Empty leaves the bridge unconfigured.       |
+| `TRAKT_CLIENT_ID`      | Optional | Browser-public  | Empty                       | Public Trakt application identifier for browser sign-in. Obtain it from the [Trakt application settings](https://app.trakt.tv/settings/apps). Empty keeps Trakt sign-in unavailable; it is the only value the bridge now requires.          |
+| `TRAKT_CLIENT_SECRET`  | Optional | **Server-only** | Empty                       | Private Trakt application credential, for applications that were issued one. It is passed only to `trakt-auth-bridge`, never written to `nuvio.env.js` or exposed to browser JavaScript. Trakt no longer issues a secret to applications that sign users in and treats it as deprecated for that purpose, so leaving it empty is now normal: the bridge sends it only when it exists. |
 | `TRAKT_REDIRECT_URI`   | Optional | **Server-only** | `urn:ietf:wg:oauth:2.0:oob` | Redirect URI registered with Trakt; it must match the application configuration. Empty uses the Compose default. See [Trakt authentication](https://docs.trakt.tv/reference/auth).            |
 
 In general, a `CLIENT_ID` is a public application identifier, while a

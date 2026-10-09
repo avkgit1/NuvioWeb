@@ -1,6 +1,13 @@
 import { createServer } from "node:http";
 
 const TRAKT_API_BASE_URL = "https://api.trakt.tv";
+
+// Cloudflare sits in front of the Trakt API and refuses requests that arrive
+// with no User-Agent at all, which is what Node's fetch sends by default. The
+// refusal is an HTML block page carrying 403, so it reads as Trakt rejecting
+// the credentials rather than as never having been asked -- and it happens
+// whether or not a client secret is configured. Naming the caller is enough.
+const TRAKT_USER_AGENT = "NuvioWeb";
 const MAX_BODY_BYTES = 8 * 1024;
 const REQUEST_TIMEOUT_MS = 10_000;
 const TOKEN_RESPONSE_FIELDS = new Set([
@@ -19,11 +26,12 @@ const DEVICE_RESPONSE_FIELDS = new Set([
   "interval"
 ]);
 
-function json(response, status, payload) {
+function json(response, status, payload, extraHeaders = {}) {
   response.writeHead(status, {
     "Content-Type": "application/json; charset=utf-8",
     "Cache-Control": "no-store",
-    "X-Content-Type-Options": "nosniff"
+    "X-Content-Type-Options": "nosniff",
+    ...extraHeaders
   });
   response.end(JSON.stringify(payload));
 }
@@ -75,13 +83,32 @@ function bridgeConfiguration(environment) {
   };
 }
 
+// Trakt stopped issuing a client secret to apps that sign users in, and says
+// the secret is deprecated for user sign-in: a secret shipped inside a website
+// is not a secret. The device flow still works without one -- checked against
+// the live API, where /oauth/device/code returns a user code from the client id
+// alone and /oauth/device/token answers with its documented pending status
+// rather than refusing the request.
+//
+// So it is sent when there is one and left out when there is not. An app issued
+// a secret before this change keeps behaving exactly as it did, which is what
+// existing self-hosted deployments are running on; an app that was never issued
+// one stops meeting a 503 on every request.
+function withClientSecret(config, body) {
+  return config.clientSecret ? { ...body, client_secret: config.clientSecret } : body;
+}
+
 async function requestTraktToken(fetchImpl, path, body) {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
   try {
     const response = await fetchImpl(`${TRAKT_API_BASE_URL}${path}`, {
       method: "POST",
-      headers: { "Content-Type": "application/json", Accept: "application/json" },
+      headers: {
+        "Content-Type": "application/json",
+        Accept: "application/json",
+        "User-Agent": TRAKT_USER_AGENT
+      },
       body: JSON.stringify(body),
       signal: controller.signal
     });
@@ -92,20 +119,38 @@ async function requestTraktToken(fetchImpl, path, body) {
     } catch {
       payload = {};
     }
-    return { status: response.status, payload };
+    // Trakt answers a rate limit with the seconds to wait. Dropping it left the
+    // browser guessing, and its guess was a flat five minutes -- so a twenty
+    // second wait was reported as five minutes, and the short automatic retry
+    // that reads this header could never fire at all.
+    return {
+      status: response.status,
+      payload,
+      retryAfter: response.headers?.get?.("Retry-After") || ""
+    };
   } finally {
     clearTimeout(timeout);
   }
 }
 
-function upstreamError(status, payload) {
+function upstreamError(status, payload, retryAfter = "") {
   const safeMessage = String(payload?.error_description || payload?.error || "Trakt authorization failed");
-  return { status: Math.max(400, Math.min(599, Number(status) || 502)), body: { error: safeMessage } };
+  const seconds = String(retryAfter || "").trim();
+  return {
+    status: Math.max(400, Math.min(599, Number(status) || 502)),
+    body: { error: safeMessage },
+    // Only a plain count of seconds is passed on. Anything else is a header
+    // this bridge does not understand, and inventing a delay is worse than
+    // offering none.
+    headers: /^[0-9]+$/.test(seconds) ? { "Retry-After": seconds } : {}
+  };
 }
 
 export function createTraktAuthBridgeHandler({ environment = process.env, fetchImpl = fetch } = {}) {
   const config = bridgeConfiguration(environment);
-  const configured = Boolean(config.clientId && config.clientSecret);
+  // The client id is the whole requirement now. Demanding a secret alongside it
+  // turned every request into a 503 for any app that cannot be issued one.
+  const configured = Boolean(config.clientId);
 
   return async function handleTraktAuthBridge(request, response) {
     const pathname = new URL(request.url || "/", "http://bridge.local").pathname;
@@ -136,8 +181,8 @@ export function createTraktAuthBridgeHandler({ environment = process.env, fetchI
           client_id: config.clientId
         });
         if (result.status < 200 || result.status >= 300) {
-          const failure = upstreamError(result.status, result.payload);
-          json(response, failure.status, failure.body);
+          const failure = upstreamError(result.status, result.payload, result.retryAfter);
+          json(response, failure.status, failure.body, failure.headers);
           return;
         }
         json(response, 200, pickFields(result.payload, DEVICE_RESPONSE_FIELDS));
@@ -148,14 +193,17 @@ export function createTraktAuthBridgeHandler({ environment = process.env, fetchI
           json(response, 400, { error: "Missing device code" });
           return;
         }
-        const result = await requestTraktToken(fetchImpl, "/oauth/device/token", {
-          code: body.code.trim(),
-          client_id: config.clientId,
-          client_secret: config.clientSecret
-        });
+        const result = await requestTraktToken(
+          fetchImpl,
+          "/oauth/device/token",
+          withClientSecret(config, {
+            code: body.code.trim(),
+            client_id: config.clientId
+          })
+        );
         if (result.status < 200 || result.status >= 300) {
-          const failure = upstreamError(result.status, result.payload);
-          json(response, failure.status, failure.body);
+          const failure = upstreamError(result.status, result.payload, result.retryAfter);
+          json(response, failure.status, failure.body, failure.headers);
           return;
         }
         json(response, 200, pickFields(result.payload, TOKEN_RESPONSE_FIELDS));
@@ -166,16 +214,19 @@ export function createTraktAuthBridgeHandler({ environment = process.env, fetchI
           json(response, 400, { error: "Missing refresh token" });
           return;
         }
-        const result = await requestTraktToken(fetchImpl, "/oauth/token", {
-          refresh_token: body.refresh_token.trim(),
-          client_id: config.clientId,
-          client_secret: config.clientSecret,
-          redirect_uri: config.redirectUri,
-          grant_type: "refresh_token"
-        });
+        const result = await requestTraktToken(
+          fetchImpl,
+          "/oauth/token",
+          withClientSecret(config, {
+            refresh_token: body.refresh_token.trim(),
+            client_id: config.clientId,
+            redirect_uri: config.redirectUri,
+            grant_type: "refresh_token"
+          })
+        );
         if (result.status < 200 || result.status >= 300) {
-          const failure = upstreamError(result.status, result.payload);
-          json(response, failure.status, failure.body);
+          const failure = upstreamError(result.status, result.payload, result.retryAfter);
+          json(response, failure.status, failure.body, failure.headers);
           return;
         }
         json(response, 200, pickFields(result.payload, TOKEN_RESPONSE_FIELDS));
